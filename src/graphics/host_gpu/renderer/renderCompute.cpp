@@ -44,7 +44,7 @@ static uint64_t BufferDescriptorSize(const ShaderBufferResource& descriptor) {
 }
 
 bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
-                                                const RenderCommandBuffer&    buffer) {
+                                                const CommandBuffer&          buffer) {
 	const auto& program   = *input.stage.program;
 	const auto& resources = *input.stage.resources;
 	if (resources.buffers.size() != program.info.buffers.size()) {
@@ -81,9 +81,8 @@ bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t grou
 	const auto& program   = *input.stage.program;
 	const auto& resources = *input.stage.resources;
 	if (program.info.buffers.size() != 1 || resources.buffers.size() != 1 ||
-	    !program.info.images.empty() || !program.info.samplers.empty() ||
-	    !program.info.addresses.empty() || !resources.images.empty() ||
-	    !resources.samplers.empty() || !resources.addresses.empty()) {
+	    !program.info.images.empty() || !program.info.samplers.empty() || program.info.uses_dma ||
+	    !resources.images.empty() || !resources.samplers.empty()) {
 		return false;
 	}
 	const auto& resource   = program.info.buffers.front();
@@ -163,7 +162,7 @@ static bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input, Com
 	return true;
 }
 
-void RenderExecutor::DispatchDirect(uint64_t submit_id, RenderCommandBuffer& buffer,
+void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode) {
 	EXIT_IF(buffer.IsInvalid());
@@ -208,18 +207,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, RenderCommandBuffer& buf
 	const auto& cs_regs = sh_ctx.GetCs();
 	const auto& sh_regs = ctx.GetShaderRegisters();
 
-	ShaderComputeInputInfo    input_info {};
-	std::span<const uint32_t> cs_shader;
-	if (!ShaderCompileInfoCS(cs_regs, sh_regs,
-	                         !m_context.GetGraphics().compute_wave64_supported, input_info,
-	                         cs_shader)) {
-		EXIT("ShaderCompileInfoCS failed for dispatch with CS shader 0x%016" PRIx64 "\n",
-		     cs_regs.cs_regs.data_addr);
-	}
-
+	ShaderComputeInputInfo input_info {};
 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
+	input_info.dispatch_thread_dimensions = use_thread_dimensions;
+	const auto compute_program =
+	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
 	if (use_thread_dimensions) {
-		input_info.dispatch_thread_dimensions = true;
 		input_info.dispatch_threads_num[0]    = thread_group_x;
 		input_info.dispatch_threads_num[1]    = thread_group_y;
 		input_info.dispatch_threads_num[2]    = thread_group_z;
@@ -334,9 +327,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, RenderCommandBuffer& buf
 
 	buffer.EndRendering();
 	auto& pipeline =
-	    m_context.GetPipelineCache().CreateComputePipeline(input_info, sh_ctx.GetCs(), cs_shader);
+	    m_context.GetPipelineCache().CreateComputePipeline(input_info, compute_program);
 	auto bindings = PrepareBindings(input_info.stage);
 	FindBuffers(bindings);
+	if (program.info.uses_dma) {
+		m_context.GetGpuResources().PrepareBda();
+	}
 	RebindBuffers(bindings);
 	RebindImages(bindings);
 

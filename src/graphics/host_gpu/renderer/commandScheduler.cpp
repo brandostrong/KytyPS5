@@ -196,8 +196,8 @@ void CommandScheduler::Finish() {
 		Submit();
 	}
 	m_master.Wait(CurrentTick() - 1);
-	PopPendingOperations();
 	BeginNext();
+	PopPendingOperations();
 }
 
 void CommandScheduler::Wait(uint64_t tick) {
@@ -346,7 +346,7 @@ void CommandScheduler::CheckActive() const {
 	EXIT_IF(!Active());
 }
 
-RenderCommandBuffer& CommandScheduler::Current() {
+CommandBuffer& CommandScheduler::Current() {
 	CheckActive();
 	return m_command;
 }

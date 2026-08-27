@@ -27,7 +27,7 @@ static bool RenderTargetMaskHasMrt(uint32_t mask) {
 	return (mask & ~0x0fu) != 0;
 }
 
-static bool RenderTargetMaskHasBoundMrt(const RenderCommandBuffer& buffer) {
+static bool RenderTargetMaskHasBoundMrt(const CommandBuffer& buffer) {
 	const auto& hw   = buffer.GetRegisters();
 	const auto  mask = hw.GetRenderTargetMask();
 
@@ -45,7 +45,7 @@ static bool RenderTargetMaskHasBoundMrt(const RenderCommandBuffer& buffer) {
 	return bound_targets > 1;
 }
 
-uint32_t render_target_first_bound_slot(const RenderCommandBuffer& buffer) {
+uint32_t render_target_first_bound_slot(const CommandBuffer& buffer) {
 	const auto& hw   = buffer.GetRegisters();
 	const auto  mask = hw.GetRenderTargetMask();
 	for (uint32_t i = 0; i < 8; i++) {
@@ -280,11 +280,10 @@ static void RtCheck(const HW::RenderTarget& rt) {
 				logged = true;
 			}
 		}
-		const bool native_2x_one_frag = rt.info.fmask_compression_enable &&
-		                                !rt.info.fmask_data_compression_disable &&
-		                                rt.info.cmask_fast_clear_enable && rt.fmask.addr != 0 &&
-		                                rt.cmask.addr != 0 && rt.attrib.num_samples == 1 &&
-		                                rt.attrib.num_fragments == 1;
+		const bool native_2x_one_frag =
+		    rt.info.fmask_compression_enable && !rt.info.fmask_data_compression_disable &&
+		    rt.info.cmask_fast_clear_enable && rt.fmask.addr != 0 && rt.cmask.addr != 0 &&
+		    rt.attrib.num_samples == 1 && rt.attrib.num_fragments == 1;
 		EXIT_NOT_IMPLEMENTED(rt.info.fmask_one_frag_mode && !native_2x_one_frag);
 		if (rt.info.fmask_compression_enable) {
 			EXIT_NOT_IMPLEMENTED(rt.attrib.num_samples == 0 && rt.attrib.num_fragments == 0);
@@ -903,12 +902,10 @@ void LogDrawPhase(const char* draw_name, const char* phase) {
 	}
 }
 
-void LogPipelineTrace(const char* phase, uint32_t vs_hash0, uint32_t vs_crc32, uint32_t ps_hash0,
-                      uint32_t ps_crc32) {
+void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id) {
 	if (graphics_debug_dump_enabled()) {
-		LOGF("PipelineTrace: %s VS=0x%08" PRIx32 "/0x%08" PRIx32 " PS=0x%08" PRIx32 "/0x%08" PRIx32
-		     "\n",
-		     phase, vs_hash0, vs_crc32, ps_hash0, ps_crc32);
+		LOGF("PipelineTrace: %s VS=%" PRIu64 " PS=%" PRIu64 "\n", phase, vertex_program_id,
+		     pixel_program_id);
 	}
 }
 
@@ -1172,7 +1169,7 @@ ScissorRect calc_final_scissor(const HW::ScreenViewport& vp, const HW::ScanModeC
 	return ScissorRectClamp(final, extent.width, extent.height);
 }
 
-void hw_check(const RenderCommandBuffer& buffer) {
+void hw_check(const CommandBuffer& buffer) {
 	const auto& hw      = buffer.GetRegisters();
 	const auto  rt_slot = render_target_first_bound_slot(buffer);
 	const auto& rt      = hw.GetRenderTarget(rt_slot);
@@ -1245,7 +1242,7 @@ void hw_check(const RenderCommandBuffer& buffer) {
 	// EXIT_NOT_IMPLEMENTED(hw.GetStencilClearValue() != 0);
 }
 
-void hw_print(const RenderCommandBuffer& buffer) {
+void hw_print(const CommandBuffer& buffer) {
 	const auto& hw      = buffer.GetRegisters();
 	const auto  rt_slot = render_target_first_bound_slot(buffer);
 	const auto& rt      = hw.GetRenderTarget(rt_slot);

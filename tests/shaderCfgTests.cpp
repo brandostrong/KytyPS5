@@ -25,6 +25,7 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
 #include "graphics/shader/shader.h"
+#include "graphics/shader/shaderCompiler.h"
 #include "libs/agc.h"
 #include "spirv-tools/libspirv.hpp"
 
@@ -74,6 +75,46 @@ ShaderRecompiler::CompileOptions MakeCompileOptions(ShaderType stage) {
     std::abort();
   }
   return options;
+}
+
+bool ReadHostTestMemory(void *, uint64_t address, uint32_t *value) {
+  if (address == 0 || value == nullptr) {
+    return false;
+  }
+  std::memcpy(value, reinterpret_cast<const void *>(address), sizeof(*value));
+  return true;
+}
+
+bool CompilePixelRuntime(const ShaderParams &params,
+                         ShaderPixelInputInfo &input_info,
+                         std::string *error) {
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.shader_hash = params.hash;
+  options.shader_base = params.Base();
+  options.user_data = params.user_data.data();
+  options.user_data_count = static_cast<uint32_t>(params.user_data.size());
+  options.scratch_dwords = input_info.scratch_size_dwords;
+  options.push_constant_offset = input_info.push_constant_offset;
+  options.read_specialization_memory = ReadHostTestMemory;
+  options.input_info.pixel = &input_info;
+  ShaderRecompiler::CompileResult result;
+  if (!ShaderRecompiler::TryRecompile(params.code, options, result, error)) {
+    return false;
+  }
+  input_info.stage.program =
+      std::make_shared<const ShaderRecompiler::IR::Program>(
+          std::move(result.program));
+  input_info.stage.resources =
+      std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(
+          std::move(result.resources));
+  return true;
+}
+
+template <typename InputInfo>
+std::vector<uint32_t> MakeStageStaticKey(const InputInfo &input_info) {
+  std::vector<uint32_t> key;
+  BuildStageStaticKey(input_info, key);
+  return key;
 }
 
 std::vector<uint32_t>
@@ -4319,14 +4360,14 @@ void TestNewShaderRecompilerScalarMemoryBindingDomains() {
         error.c_str());
   const auto *address_binding = ShaderRecompiler::IR::FindBinding(
       raw.program.bindings,
-      ShaderRecompiler::IR::DescriptorBindingKind::AddressMemory);
-  Check(raw.program.info.addresses.size() == 1u &&
-            raw.program.info.addresses[0].kind ==
-                ShaderRecompiler::IR::ResourceKind::ScalarAddress &&
-            raw.program.info.addresses[0].read &&
-            !raw.program.info.addresses[0].written &&
-            raw.program.info.buffers.empty() && address_binding != nullptr &&
-            address_binding->resources == std::vector<uint32_t>{0u} &&
+      ShaderRecompiler::IR::DescriptorBindingKind::BdaPagetable);
+  const auto *fault_binding = ShaderRecompiler::IR::FindBinding(
+      raw.program.bindings,
+      ShaderRecompiler::IR::DescriptorBindingKind::FaultBuffer);
+  Check(raw.program.info.uses_dma && raw.program.info.buffers.empty() &&
+            address_binding != nullptr && fault_binding != nullptr &&
+            address_binding->resources.empty() &&
+            fault_binding->resources.empty() &&
             ShaderRecompiler::IR::FindBinding(
                 raw.program.bindings,
                 ShaderRecompiler::IR::DescriptorBindingKind::Buffers) ==
@@ -4335,17 +4376,12 @@ void TestNewShaderRecompilerScalarMemoryBindingDomains() {
                 raw.program.bindings,
                 ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) ==
                 nullptr &&
-            raw.program.bindings.memory_offset_count == 1u,
-        "raw scalar load did not use only the address-memory domain");
+            raw.program.bindings.memory_offset_count == 0u,
+        "raw scalar load did not use only the DMA domain");
   Check(count_live_memory_ops(
             raw.program, ShaderRecompiler::IR::ValueOpcode::LoadAddressU32,
             ShaderRecompiler::IR::ResourceKind::ScalarAddress) == 1u,
         "raw scalar load did not remain a live typed address operation");
-  Check(raw.resources.addresses.size() == 1u &&
-            raw.resources.addresses[0].guest_base == 0x1000u &&
-            raw.resources.addresses[0].binding_base == 0x1000u &&
-            raw.program.info.addresses[0].specialized_base == 0u,
-        "raw scalar address specialization was incorrect");
   Check(SpirvContainsOpcode(raw.spirv, 199),
         "raw scalar SOFFSET alignment was not emitted");
   CheckSpirvBinaryValidates(raw.spirv);
@@ -4377,12 +4413,12 @@ void TestNewShaderRecompilerScalarMemoryBindingDomains() {
       ShaderRecompiler::IR::DescriptorBindingKind::Buffers);
   Check(buffer.program.info.buffers.size() == 1u &&
             buffer.program.info.buffers[0].scalar &&
-            buffer.program.info.addresses.empty() &&
+            !buffer.program.info.uses_dma &&
             buffer_binding != nullptr &&
             buffer_binding->resources == std::vector<uint32_t>{0u} &&
             ShaderRecompiler::IR::FindBinding(
                 buffer.program.bindings,
-                ShaderRecompiler::IR::DescriptorBindingKind::AddressMemory) ==
+                ShaderRecompiler::IR::DescriptorBindingKind::BdaPagetable) ==
                 nullptr &&
             ShaderRecompiler::IR::FindBinding(
                 buffer.program.bindings,
@@ -6201,7 +6237,6 @@ void TestNewShaderRecompilerFlatOldBackedTranslation() {
 
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
-  options.flat_memory_base = 0;
 
   ShaderRecompiler::CompileResult result;
   std::string error;
@@ -6224,23 +6259,32 @@ void TestNewShaderRecompilerFlatOldBackedTranslation() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
-void TestNewShaderRecompilerUnbasedFlatRequiresTranslator() {
+void TestNewShaderRecompilerUnbasedFlatUsesBda() {
   const uint32_t shader[] = {
       EncodeFlat0(0x0c, 0, 0),
       EncodeFlat1(0, 0x7d, 0, 1),
-      EncodeFlat0(0x1c, 0, 0),
-      EncodeFlat1(0, 0x7d, 0, 2),
-      0xbf810000u,
+      EncodeExp0(0x00, 0x1),
+      EncodeExp1(0, 0, 0, 0),
+      EncodeSopp(0x01),
   };
 
-  auto options = MakeCompileOptions(ShaderType::Compute);
+  auto options = MakeCompileOptions(ShaderType::Pixel);
 
   ShaderRecompiler::CompileResult result;
   std::string error;
-  Check(!ShaderRecompiler::TryRecompile(shader, options, result, &error) &&
-            Common::ContainsStr(error,
-                                "requires runtime guest-address translation"),
-        "unbased FLAT compiled without an explicit translator");
+  Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
+        error.c_str());
+  Check(result.program.info.uses_dma &&
+            ShaderRecompiler::IR::FindBinding(
+                result.program.bindings,
+                ShaderRecompiler::IR::DescriptorBindingKind::BdaPagetable) !=
+                nullptr &&
+            ShaderRecompiler::IR::FindBinding(
+                result.program.bindings,
+                ShaderRecompiler::IR::DescriptorBindingKind::FaultBuffer) !=
+                nullptr,
+        "unbased FLAT did not compile through BDA");
+  CheckSpirvBinaryValidates(result.spirv);
 }
 
 void TestNewShaderRecompilerFlatSignedLoadTranslation() {
@@ -6256,7 +6300,6 @@ void TestNewShaderRecompilerFlatSignedLoadTranslation() {
 
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
-  options.flat_memory_base = 0;
 
   ShaderRecompiler::CompileResult result;
   std::string error;
@@ -6311,7 +6354,6 @@ void TestNewShaderRecompilerFlatStoreTranslation() {
 
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
-  options.flat_memory_base = 0;
 
   ShaderRecompiler::CompileResult result;
   std::string error;
@@ -9106,7 +9148,7 @@ void TestNewShaderRecompilerAuxPositionExports() {
   ShaderVertexInputInfo key0{};
   ShaderVertexInputInfo key1{};
   key1.pa_cl_vs_out_cntl = 1;
-  Check(ShaderGetIdVS(regs, key0, false) != ShaderGetIdVS(regs, key1, false),
+  Check(MakeStageStaticKey(key0) != MakeStageStaticKey(key1),
         "PA_CL_VS_OUT_CNTL is absent from the vertex shader cache key");
 }
 
@@ -10512,8 +10554,7 @@ void TestRenderTargetReverseExportMapping() {
   reversed_info.target_export_mapping[0] = gr32.export_mapping;
 
   HW::PixelShaderInfo regs{};
-  Check(ShaderGetIdPS(regs, identity_info, false) !=
-            ShaderGetIdPS(regs, reversed_info, false),
+  Check(MakeStageStaticKey(identity_info) != MakeStageStaticKey(reversed_info),
         "pixel shader cache identity omitted the render-target export mapping");
 
   regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(shader);
@@ -10526,18 +10567,13 @@ void TestRenderTargetReverseExportMapping() {
   mappings[0] = gr32.export_mapping;
   ShaderPixelInputInfo compiled_info{};
   ShaderVertexInputInfo vertex_info{};
-  std::span<const uint32_t> compiled_spirv;
-  Check(
-      ShaderCompileInfoPS(regs, sh, vertex_info, mappings, compiled_info,
-                          compiled_spirv) &&
-          compiled_info.target_export_mapping[0].IsIdentity(),
-      "inactive reverse MRT mapping was not normalized out of the shader "
+  PrepareProgram(regs, sh, vertex_info, mappings, compiled_info);
+  Check(compiled_info.target_export_mapping[0].IsIdentity(),
+        "inactive reverse MRT mapping was not normalized out of the shader "
       "cache key");
   sh.target_output_mode[0] = 4;
-  Check(
-      ShaderCompileInfoPS(regs, sh, vertex_info, mappings, compiled_info,
-                          compiled_spirv) &&
-          compiled_info.target_export_mapping[0] == gr32.export_mapping,
+  PrepareProgram(regs, sh, vertex_info, mappings, compiled_info);
+  Check(compiled_info.target_export_mapping[0] == gr32.export_mapping,
       "active reverse MRT mapping was lost before shader specialization");
 }
 
@@ -11516,15 +11552,12 @@ void TestNewShaderRecompilerPixelPipelineEntry() {
   ShaderMapUserData(regs.ps_regs.data_addr, mapped);
 
   HW::ShaderRegisters sh{};
+  const std::array<Prospero::ColorComponentMapping, 8> mappings{};
+  ShaderVertexInputInfo vertex_info{};
   ShaderPixelInputInfo input_info{};
-  std::vector<uint32_t> spirv;
-  Check(ShaderCompileSpirvPS(regs, sh, input_info, spirv),
-        "new pixel shader recompiler wrapper did not produce SPIR-V");
-  Check(!spirv.empty(),
-        "new pixel shader recompiler wrapper returned empty SPIR-V");
-  Check(spirv.front() == 0x07230203u,
-        "new pixel shader recompiler wrapper did not emit SPIR-V binary");
-  CheckSpirvBinaryValidates(spirv);
+  const auto params = PrepareProgram(regs, sh, vertex_info, mappings, input_info);
+  Check(params.hash == regs.ps_regs.chksum && params.code.data() == shader,
+        "pixel shader program parameters lost source identity");
 
   const uint32_t vcc_load_shader[] = {
       EncodeSMovB32(106, 27), EncodeSMovB32(107, 28), EncodeSmem0(0x02, 44, 53),
@@ -11550,10 +11583,10 @@ void TestNewShaderRecompilerPixelPipelineEntry() {
   ShaderMapUserData(vcc_regs.ps_regs.data_addr, vcc_mapped);
 
   ShaderPixelInputInfo vcc_input{};
-  std::vector<uint32_t> vcc_spirv;
-  Check(ShaderCompileSpirvPS(vcc_regs, sh, vcc_input, vcc_spirv),
-        "VCC raw-load pointer was lost");
-  CheckSpirvBinaryValidates(vcc_spirv);
+  const auto vcc_params =
+      PrepareProgram(vcc_regs, sh, vertex_info, mappings, vcc_input);
+  std::string error;
+  Check(CompilePixelRuntime(vcc_params, vcc_input, &error), error.c_str());
 }
 
 void TestComputeLdsAllocationIdentity() {
@@ -11576,19 +11609,28 @@ void TestComputeLdsAllocationIdentity() {
                            uint32_t expected_dwords) {
     regs.cs_regs.lds_size = encoded_lds_size;
     ShaderComputeInputInfo input_info{};
-    std::span<const uint32_t> spirv;
-    Check(ShaderCompileInfoCS(regs, sh, false, input_info, spirv),
-          "compute LDS allocation shader did not compile");
+    const auto params = PrepareProgram(regs, sh, input_info);
     Check(input_info.lds_size_dwords == expected_dwords,
           "COMPUTE_PGM_RSRC2 LDS allocation units were not decoded");
-    const std::vector<uint32_t> binary(spirv.begin(), spirv.end());
-    Check(MeasureSpirv(binary).workgroup_variables == 1u,
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.shader_hash = params.hash;
+    options.shader_base = params.Base();
+    options.user_data = params.user_data.data();
+    options.user_data_count = static_cast<uint32_t>(params.user_data.size());
+    options.input_info.compute = &input_info;
+    options.wave_size = input_info.wave_size;
+    options.scratch_dwords = input_info.scratch_size_dwords;
+    ShaderRecompiler::CompileResult result;
+    std::string error;
+    Check(ShaderRecompiler::TryRecompile(shader, options, result, &error),
+          error.c_str());
+    Check(MeasureSpirv(result.spirv).workgroup_variables == 1u,
           "LDS shader did not declare exactly one Workgroup variable");
-    Check(SpirvArrayLengthCount(binary, expected_dwords) == 1u,
+    Check(SpirvArrayLengthCount(result.spirv, expected_dwords) == 1u,
           "SPIR-V workgroup array did not use the declared LDS allocation");
-    Check(SpirvUnsignedLessThanBoundCount(binary, expected_dwords) == 1u,
+    Check(SpirvUnsignedLessThanBoundCount(result.spirv, expected_dwords) == 1u,
           "LDS bounds check did not use the declared allocation");
-    CheckSpirvBinaryValidates(binary);
+    CheckSpirvBinaryValidates(result.spirv);
     return input_info;
   };
 
@@ -11601,21 +11643,19 @@ void TestComputeLdsAllocationIdentity() {
   };
   const auto lds_1152 = compile(decode_lds_field(lds_1152_rsrc2), 1152u);
   const auto lds_896 = compile(decode_lds_field(lds_896_rsrc2), 896u);
-  Check(ShaderGetIdCS(regs, lds_1152, true) !=
-            ShaderGetIdCS(regs, lds_896, true),
+  Check(MakeStageStaticKey(lds_1152) != MakeStageStaticKey(lds_896),
         "compute pipeline identity omitted the LDS allocation");
 
   auto split_wave = lds_896;
   split_wave.needs_lds_barriers = true;
-  Check(ShaderGetIdCS(regs, lds_896, true) !=
-            ShaderGetIdCS(regs, split_wave, true),
+  Check(MakeStageStaticKey(lds_896) != MakeStageStaticKey(split_wave),
         "compute shader identity omitted split-wave LDS synchronization");
 
   auto tg_size_disabled = lds_896;
   auto tg_size_enabled = lds_896;
   tg_size_enabled.tg_size_en = true;
-  Check(ShaderGetIdCS(regs, tg_size_disabled, false) !=
-            ShaderGetIdCS(regs, tg_size_enabled, false),
+  Check(MakeStageStaticKey(tg_size_disabled) !=
+            MakeStageStaticKey(tg_size_enabled),
         "compute shader identity omitted TG_SIZE semantics");
 
   auto dispatch_disabled = lds_896;
@@ -11624,32 +11664,42 @@ void TestComputeLdsAllocationIdentity() {
   dispatch_disabled.dispatch_threads_num[2] = 1;
   auto dispatch_enabled = dispatch_disabled;
   dispatch_enabled.dispatch_thread_dimensions = true;
-  Check(ShaderGetIdCS(regs, dispatch_disabled, false) ==
-            ShaderGetIdCS(regs, dispatch_enabled, false),
-        "runtime dispatch enable created a compute shader variant");
+  Check(MakeStageStaticKey(dispatch_disabled) !=
+            MakeStageStaticKey(dispatch_enabled),
+        "dispatch-dimension mode did not select a compute shader variant");
 
   auto second_extent = dispatch_enabled;
   second_extent.dispatch_threads_num[0] = 1920;
   second_extent.dispatch_threads_num[1] = 1080;
   second_extent.dispatch_threads_num[2] = 4;
-  Check(ShaderGetIdCS(regs, dispatch_enabled, false) ==
-            ShaderGetIdCS(regs, second_extent, false),
+  Check(MakeStageStaticKey(dispatch_enabled) ==
+            MakeStageStaticKey(second_extent),
         "runtime dispatch extent created a compute shader variant");
 
   mapped.scratch_size_dwords = 7;
   ShaderMapUserData(regs.cs_regs.data_addr, mapped);
   regs.cs_regs.lds_size = decode_lds_field(lds_896_rsrc2);
   ShaderComputeInputInfo scratch_info{};
-  std::span<const uint32_t> scratch_spirv;
-  Check(ShaderCompileInfoCS(regs, sh, false, scratch_info, scratch_spirv),
-        "compute scratch metadata shader did not compile");
+  const auto scratch_params = PrepareProgram(regs, sh, scratch_info);
   Check(scratch_info.scratch_size_dwords == 7,
         "AGC per-thread scratch size was not propagated");
-  Check(scratch_info.stage.program != nullptr &&
-            scratch_info.stage.program->scratch_dwords == 7,
+  auto scratch_options = MakeCompileOptions(ShaderType::Compute);
+  scratch_options.shader_hash = scratch_params.hash;
+  scratch_options.shader_base = scratch_params.Base();
+  scratch_options.user_data = scratch_params.user_data.data();
+  scratch_options.user_data_count =
+      static_cast<uint32_t>(scratch_params.user_data.size());
+  scratch_options.input_info.compute = &scratch_info;
+  scratch_options.wave_size = scratch_info.wave_size;
+  scratch_options.scratch_dwords = scratch_info.scratch_size_dwords;
+  ShaderRecompiler::CompileResult scratch_result;
+  std::string scratch_error;
+  Check(ShaderRecompiler::TryRecompile(scratch_params.code, scratch_options,
+                                       scratch_result, &scratch_error),
+        scratch_error.c_str());
+  Check(scratch_result.program.scratch_dwords == 7,
         "AGC per-thread scratch size did not reach the compiler program");
-  Check(ShaderGetIdCS(regs, scratch_info, true) !=
-            ShaderGetIdCS(regs, lds_896, true),
+  Check(MakeStageStaticKey(scratch_info) != MakeStageStaticKey(lds_896),
         "compute pipeline identity omitted the scratch allocation");
 
   const uint32_t append_shader[] = {
@@ -11809,20 +11859,18 @@ void TestPixelProgramCacheBindingIdentity() {
   const uint32_t shader_10[] = {0xbf810000u};
   HW::ShaderRegisters sh{};
 
-  HW::PixelShaderInfo identity_regs{};
   ShaderPixelInputInfo no_depth_export{};
   auto depth_export = no_depth_export;
   depth_export.ps_depth_export_enable = true;
-  Check(ShaderGetIdPS(identity_regs, no_depth_export, false) !=
-            ShaderGetIdPS(identity_regs, depth_export, false),
+  Check(MakeStageStaticKey(no_depth_export) != MakeStageStaticKey(depth_export),
         "pixel shader identity omitted depth-export semantics");
   auto shifted_push = no_depth_export;
   shifted_push.push_constant_offset = 36;
-  Check(ShaderGetIdPS(identity_regs, no_depth_export, false) !=
-            ShaderGetIdPS(identity_regs, shifted_push, false),
+  Check(MakeStageStaticKey(no_depth_export) != MakeStageStaticKey(shifted_push),
         "pixel shader identity omitted graphics push-bank placement");
 
-  auto check_cache_identity = [&](const uint32_t *shader, uint64_t checksum) {
+  auto check_program_identity = [&](const uint32_t *shader,
+                                    uint64_t checksum) {
     HW::PixelShaderInfo regs{};
     regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(shader);
     regs.ps_regs.chksum = checksum;
@@ -11833,26 +11881,29 @@ void TestPixelProgramCacheBindingIdentity() {
     const std::array<Prospero::ColorComponentMapping, 8> identity_mappings{};
     ShaderVertexInputInfo vertex_info{};
     ShaderPixelInputInfo first_info{};
-    std::span<const uint32_t> first_spirv;
-    Check(ShaderCompileInfoPS(regs, sh, vertex_info, identity_mappings, first_info,
-                              first_spirv),
-          "pixel program-cache fixture failed to compile");
+    const auto first_params =
+        PrepareProgram(regs, sh, vertex_info, identity_mappings, first_info);
+    const auto first_key = MakeStageStaticKey(first_info);
+    std::string error;
+    Check(CompilePixelRuntime(first_params, first_info, &error), error.c_str());
 
     ShaderPixelInputInfo second_info{};
-    std::span<const uint32_t> second_spirv;
-    Check(ShaderCompileInfoPS(regs, sh, vertex_info, identity_mappings, second_info,
-                              second_spirv),
-          "pixel program-cache lookup failed");
+    const auto second_params =
+        PrepareProgram(regs, sh, vertex_info, identity_mappings, second_info);
     Check(
-        first_info.stage.program != nullptr &&
-            second_info.stage.program == first_info.stage.program &&
-            second_spirv.data() == first_spirv.data() &&
-            second_spirv.size() == first_spirv.size(),
-        "pixel program cache did not reuse an identical graphics placement");
+        first_params.hash == second_params.hash &&
+            first_key == MakeStageStaticKey(second_info) &&
+            first_info.stage.program != nullptr &&
+            MaterializeProgram(first_info.stage.program, second_params, second_info) &&
+            second_info.stage.program == first_info.stage.program,
+        "pixel program matching did not reuse an identical graphics placement");
+    return std::pair {first_params.hash, first_key};
   };
 
-  check_cache_identity(shader_01, 0x91a27e6300000001ull);
-  check_cache_identity(shader_10, 0x91a27e6300000002ull);
+  const auto request_01 = check_program_identity(shader_01, 0);
+  const auto request_10 = check_program_identity(shader_10, 0);
+  Check(request_01 == request_10,
+        "relocated identical pixel programs did not share their source identity");
 
   const uint32_t push_shader[] = {
       EncodeVop1(0x01, 0, 0), EncodeVop1(0x01, 1, 1),
@@ -11882,24 +11933,36 @@ void TestPixelProgramCacheBindingIdentity() {
   ShaderPixelInputInfo at_zero{};
   ShaderPixelInputInfo at_36{};
   ShaderPixelInputInfo at_zero_again{};
-  std::span<const uint32_t> spirv_at_zero;
-  std::span<const uint32_t> spirv_at_36;
-  std::span<const uint32_t> spirv_at_zero_again;
-  Check(ShaderCompileInfoPS(push_regs, push_sh, vertex_at_zero, mappings,
-                            at_zero, spirv_at_zero) &&
-            ShaderCompileInfoPS(push_regs, push_sh, vertex_at_36, mappings,
-                                at_36, spirv_at_36) &&
-            ShaderCompileInfoPS(push_regs, push_sh, vertex_at_zero, mappings,
-                                at_zero_again, spirv_at_zero_again),
-        "pixel program-cache placement fixture failed to compile");
+  const auto params_at_zero =
+      PrepareProgram(push_regs, push_sh, vertex_at_zero, mappings, at_zero);
+  const auto key_at_zero = MakeStageStaticKey(at_zero);
+  std::string error;
+  Check(CompilePixelRuntime(params_at_zero, at_zero, &error), error.c_str());
+  const auto params_at_36 =
+      PrepareProgram(push_regs, push_sh, vertex_at_36, mappings, at_36);
+  const auto key_at_36 = MakeStageStaticKey(at_36);
+  Check(CompilePixelRuntime(params_at_36, at_36, &error), error.c_str());
+  const auto params_at_zero_again =
+      PrepareProgram(push_regs, push_sh, vertex_at_zero, mappings,
+                     at_zero_again);
+  auto shifted_options = MakeCompileOptions(ShaderType::Pixel);
+  shifted_options.input_info.pixel = &at_36;
+  shifted_options.push_constant_offset = at_36.push_constant_offset;
+  ShaderRecompiler::CompileResult shifted_result;
+  std::string shifted_error;
+  Check(ShaderRecompiler::TryRecompile(push_shader, shifted_options,
+                                       shifted_result, &shifted_error),
+        shifted_error.c_str());
   Check(at_zero.push_constant_offset == 0 &&
             at_36.push_constant_offset == 36 &&
+            key_at_zero != key_at_36 &&
+            MakeStageStaticKey(at_zero_again) == key_at_zero &&
             at_zero.stage.program != at_36.stage.program &&
-            spirv_at_zero.data() != spirv_at_36.data() &&
+            MaterializeProgram(at_zero.stage.program, params_at_zero_again,
+                               at_zero_again) &&
             at_zero_again.stage.program == at_zero.stage.program &&
-            spirv_at_zero_again.data() == spirv_at_zero.data() &&
-            SpirvHasMemberDecorationValue(spirv_at_36, 35u, 36u),
-        "pixel program cache did not partition and reuse graphics push placement");
+            SpirvHasMemberDecorationValue(shifted_result.spirv, 35u, 36u),
+        "pixel program matching did not partition and reuse graphics push placement");
 }
 
 void TestGraphicsPushConstantPlacement() {
@@ -11966,49 +12029,40 @@ void TestNewShaderRecompilerUnsupportedMemoryDecode() {
                              "MTBUF", "opcode=0x08");
 }
 
-void TestNewShaderRecompilerFlatUserPointerProvenance() {
+void TestNewShaderRecompilerFlatUserPointerUsesDma() {
   const uint32_t shader[] = {
       EncodeVop2(0x25, 0, 0, 2), // v_add_nc_u32 v0, s0, v2
       EncodeVop1(0x01, 1, 1),    // v_mov_b32 v1, s1
-      EncodeFlat0(0x1c, 0, 0),
-      EncodeFlat1(0, 0x7d, 3, 0), // flat_store_dword v3, v[0:1]
-      0xbf810000u,
+      EncodeFlat0(0x0c, 0, 0),
+      EncodeFlat1(3, 0x7d, 0, 0), // flat_load_dword v3, v[0:1]
+      EncodeExp0(0x00, 0x1),
+      EncodeExp1(3, 0, 0, 0),
+      EncodeSopp(0x01),
   };
   const uint32_t user_data[] = {0x34567000u, 0x00000012u};
 
-  auto options = MakeCompileOptions(ShaderType::Compute);
+  auto options = MakeCompileOptions(ShaderType::Pixel);
   options.user_data = user_data;
   options.user_data_count = static_cast<uint32_t>(std::size(user_data));
-  options.flat_memory_base = 0;
 
   ShaderRecompiler::CompileResult result;
   std::string error;
   const bool compiled =
       ShaderRecompiler::TryRecompile(shader, options, result, &error);
   Check(compiled, error.c_str());
-  Check(result.program.info.addresses.size() == 1 &&
-            !result.program.info.addresses[0].unbased &&
-            result.program.info.addresses[0].source <
-                result.program.descriptor_sources.size(),
-        "FLAT user pointer provenance was not attached");
-  Check(result.resources.addresses.size() == 1 &&
-            result.resources.addresses[0].guest_base == 0x0000001234567000ull &&
-            result.resources.addresses[0].binding_base ==
-                0x0000001234560000ull &&
-            result.program.info.addresses[0].specialized_base ==
-                0x0000001234560000ull,
-        "FLAT user pointer did not materialize its guest base");
+  Check(result.program.info.uses_dma,
+        "FLAT user pointer did not enable DMA");
   CheckSpirvBinaryValidates(result.spirv);
 }
 
-void TestNewShaderRecompilerFlatAddressProvenanceBoundaries() {
+void TestNewShaderRecompilerFlatAddressDomainsUseDma() {
   const uint32_t segmented_shader[] = {
       EncodeVop2(0x25, 0, 0, 2),
       EncodeVop1(0x01, 1, 1),
-      EncodeFlat0(0x1c, 2, 0),
-      EncodeFlat1(0, 0x7d, 3, 0), // global_store_dword v3, v[0:1]
+      EncodeFlat0(0x0c, 2, 0),
+      EncodeFlat1(3, 0x7d, 0, 0), // global_load_dword v3, v[0:1]
       EncodeFlat0(0x1c, 1, 0),
-      EncodeFlat1(0, 0x7d, 4, 0), // scratch_store_dword v4, v[0:1]
+      EncodeFlat1(0, 0x7d, 3, 0), // scratch_store_dword v3, v[0:1]
       0xbf810000u,
   };
   const uint32_t user_data[] = {0x34567000u, 0u, 0x1000u};
@@ -12016,19 +12070,14 @@ void TestNewShaderRecompilerFlatAddressProvenanceBoundaries() {
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.user_data = user_data;
   options.user_data_count = static_cast<uint32_t>(std::size(user_data));
-  options.flat_memory_base = 0;
   options.scratch_dwords = 1;
   ShaderRecompiler::CompileResult result;
   std::string error;
   const bool compiled =
       ShaderRecompiler::TryRecompile(segmented_shader, options, result, &error);
   Check(compiled, error.c_str());
-  Check(result.program.info.addresses.size() == 1 &&
-            result.program.info.addresses[0].kind ==
-                ShaderRecompiler::IR::ResourceKind::Global &&
-            result.program.info.addresses[0].unbased &&
-            result.program.info.addresses[0].source == UINT32_MAX,
-        "GLOBAL null-SADDR did not remain an unbased guest address");
+  Check(result.program.info.uses_dma,
+        "GLOBAL null-SADDR did not enable DMA");
   Check(Common::ContainsStr(result.ir_dump, "GetScratchResource") &&
             result.program.scratch_dwords == 1,
         "SCRATCH incorrectly entered guest address tracking");
@@ -12324,9 +12373,9 @@ int main() {
   TestNewShaderRecompilerRejectsDppOn64BitCompares();
   TestNewShaderRecompilerIrLookupMissFailsExplicitly();
   TestPsInputCountRegisterDecode();
-  TestNewShaderRecompilerUnbasedFlatRequiresTranslator();
-  TestNewShaderRecompilerFlatUserPointerProvenance();
-  TestNewShaderRecompilerFlatAddressProvenanceBoundaries();
+  TestNewShaderRecompilerUnbasedFlatUsesBda();
+  TestNewShaderRecompilerFlatUserPointerUsesDma();
+  TestNewShaderRecompilerFlatAddressDomainsUseDma();
   TestNewShaderRecompilerCfgStraightLine();
   TestNewShaderRecompilerCfgIfElse();
   TestNewShaderRecompilerCfgConsecutiveNativePhis();

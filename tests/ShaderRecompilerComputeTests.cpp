@@ -42,6 +42,7 @@
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
+#include "graphics/shader/shaderCompiler.h"
 #include "kernel/eventQueue.h"
 #include "kernel/memory.h"
 #include "libs/agc.h"
@@ -459,14 +460,14 @@ struct RenderExecutorTestAccess {
 
   static void ResolveRenderDepthTarget(RenderExecutor &executor,
                                        uint64_t submit_id,
-                                       RenderCommandBuffer &buffer,
+                                       CommandBuffer &buffer,
                                        RenderDepthInfo &depth) {
     executor.ResolveRenderDepthTarget(submit_id, buffer, depth);
   }
 
   static void ResolveRenderColorTarget(RenderExecutor &executor,
                                        uint64_t submit_id,
-                                       RenderCommandBuffer &buffer,
+                                       CommandBuffer &buffer,
                                        RenderColorInfo &color, uint32_t slot) {
     executor.ResolveRenderColorTarget(submit_id, buffer, color, 0, slot);
   }
@@ -919,6 +920,11 @@ void CheckLeastRecentlyUsedCacheOrdering() {
   std::printf("[host]    %-32s ok\n", "LeastRecentlyUsedCache");
 }
 
+struct BdaMapping {
+  uint64_t guest_base = 0;
+  u32 backing_offset = 0;
+};
+
 struct TestCase {
   const char *name = "";
   std::vector<u32> code;
@@ -959,15 +965,15 @@ struct TestCase {
   bool compile_only = false;
   size_t storage_buffer_range_dwords = 0;
   std::vector<u32> storage_buffer_offsets;
-  std::vector<u32> address_memory_offsets;
+  std::vector<BdaMapping> bda_mappings;
   bool expand_shader_data_storage = false;
   bool expected_force_point_sampler = false;
-  std::optional<uint64_t> flat_memory_base;
   std::vector<u32> gds_initial;
   std::vector<u32> expected_gds;
   std::vector<std::pair<std::string, size_t>> decoded_counts;
   std::vector<std::pair<std::string, size_t>> ir_counts;
   u32 expected_storage_mip_descriptors = 0;
+  std::string expected_compile_error;
 };
 
 struct GraphicsCase {
@@ -1052,12 +1058,14 @@ void CheckRectListShaders() {
   pixel.interpolator_settings[0] = 0x400u;
   pixel.interpolator_settings[1] = 0;
   pixel.stage.program = program;
-  HW::PixelShaderInfo ps_regs{};
-  const auto perspective_id = ShaderGetIdPS(ps_regs, pixel, false);
+  std::vector<uint32_t> perspective_specialization;
+  BuildStageStaticKey(pixel, perspective_specialization);
   pixel.ps_no_perspective = true;
-  const auto no_perspective_id = ShaderGetIdPS(ps_regs, pixel, false);
+  std::vector<uint32_t> no_perspective_specialization;
+  BuildStageStaticKey(pixel, no_perspective_specialization);
   pixel.ps_no_perspective = false;
-  Require(name, "pipeline identity", perspective_id != no_perspective_id,
+  Require(name, "pipeline identity",
+          perspective_specialization != no_perspective_specialization,
           "pixel interpolation mode must participate in the shader and "
           "pipeline key");
 
@@ -1168,7 +1176,6 @@ CompiledShader CompileCase(const TestCase &test) {
   options.user_data = user_data.data();
   options.read_memory = ReadTestMemory;
   options.read_memory_data = const_cast<std::vector<u32> *>(&test.initial);
-  options.flat_memory_base = test.flat_memory_base;
   options.scratch_dwords = test.compute_info.scratch_size_dwords;
   if (test.has_compute_info) {
     options.wave_size = test.compute_info.wave_size;
@@ -1177,8 +1184,14 @@ CompiledShader CompileCase(const TestCase &test) {
   ShaderRecompiler::CompileResult result;
   std::string error;
   if (!ShaderRecompiler::TryRecompile(test.code, options, result, &error)) {
+    if (!test.expected_compile_error.empty() &&
+        error.find(test.expected_compile_error) != std::string::npos) {
+      return {};
+    }
     Fail(test.name, "decode/IR", error.c_str());
   }
+  Require(test.name, "decode/IR", test.expected_compile_error.empty(),
+          "shader unexpectedly compiled despite the required rejection");
   for (const auto &[text, expected] : test.decoded_counts) {
     const auto actual = CountText(result.decoded_dump, text);
     Require(test.name, "decoded RDNA2", actual == expected,
@@ -1266,17 +1279,6 @@ CompiledShader CompileCase(const TestCase &test) {
             "storage buffer offset is not representable");
     packed_user_data[result.program.bindings.memory_offset_dword + i / 4u] |=
         offset << ((i % 4u) * 8u);
-  }
-  for (u32 i = 0; i < result.program.info.addresses.size(); i++) {
-    u32 offset = 0;
-    if (i < test.address_memory_offsets.size()) {
-      offset = test.address_memory_offsets[i];
-    }
-    Require(test.name, "shader data", offset < 256,
-            "address-memory offset is not representable");
-    const auto index = buffer_count + i;
-    packed_user_data[result.program.bindings.memory_offset_dword +
-                     index / 4u] |= offset << ((index % 4u) * 8u);
   }
   return {std::move(result.spirv), std::move(result.program),
           std::move(result.resources.flattened_srt),
@@ -1469,6 +1471,7 @@ public:
   struct Buffer {
     vk::Buffer buffer = nullptr;
     vk::DeviceMemory memory = nullptr;
+    vk::DeviceAddress device_address = 0;
     vk::DeviceSize size = 0;
     bool coherent = false;
   };
@@ -3157,7 +3160,7 @@ public:
               "chunked host copy lost bytes across its scratch boundary");
 
       constexpr uint64_t index_offset = 0x180000;
-      constexpr uint64_t index_page = BufferCache::CACHING_PAGE_SIZE;
+      constexpr uint64_t index_page = BufferCache::CACHING_PAGESIZE;
       constexpr uint64_t index_span = 3 * index_page;
       const uint64_t index_begin = base + index_offset;
       Require(name, "registered-range empty lookup",
@@ -3386,7 +3389,7 @@ public:
               "Buffer ownership");
 
       constexpr uint64_t starvation_offset = 0x100000;
-      constexpr uint64_t starvation_stride = 2 * BufferCache::CACHING_PAGE_SIZE;
+      constexpr uint64_t starvation_stride = 2 * BufferCache::CACHING_PAGESIZE;
       constexpr uint32_t starvation_count = 33;
       constexpr uint32_t starvation_value = 0x31415926u;
       BufferCacheTestAccess::SetGarbageCollectionThresholds(
@@ -3443,7 +3446,7 @@ public:
       constexpr uint64_t lookup_only_offset = 0x218000;
       constexpr uint64_t obtained_offset = 0x220000;
       constexpr uint64_t residency_size =
-          2 * BufferCache::CACHING_PAGE_SIZE;
+          2 * BufferCache::CACHING_PAGESIZE;
       BufferCacheTestAccess::SetGarbageCollectionThresholds(
           cache, std::numeric_limits<uint64_t>::max(),
           std::numeric_limits<uint64_t>::max());
@@ -4199,7 +4202,7 @@ public:
       const uint64_t mip_guest_size = mip_total.size + 256;
       Require(name, "formatted mip fixture",
               mip_sizes[0].offset == 0 &&
-                  mip_prefix_size > BufferCache::CACHING_PAGE_SIZE &&
+                  mip_prefix_size > BufferCache::CACHING_PAGESIZE &&
                   mip_prefix_size < mip_guest_size &&
                   mip_guest_size % sizeof(uint32_t) == 0,
               "single-mip fixture did not expose a cache-sized fitting backing "
@@ -6994,6 +6997,106 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckRenderExecutorColor1DDiscovery() {
+    constexpr const char *name = "RenderExecutorColor1DDiscovery";
+    constexpr uintptr_t base = 0x0000000203c00000ull;
+    constexpr uint32_t width = 512;
+    constexpr uint32_t height = 1;
+    constexpr uint32_t bytes_per_element = 4;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    EnsureRuntimeContext();
+
+    const auto pitch =
+        TileGetRenderTargetPitch(width, bytes_per_element, 0);
+    TileSizeAlign layout{};
+    Require(name, "tile layout",
+            pitch != 0 && TileGetRenderTargetSize(
+                              width, height, pitch, bytes_per_element, layout, 0),
+            "1D render-target layout is unavailable");
+    const auto allocation_size =
+        std::max<uint64_t>(layout.size, allocation_alignment);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "1D color direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "1D color fixed mapping failed");
+    std::memset(mapped, 0, allocation_size);
+
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      registers.SetColorBase(0, {.addr = base});
+      registers.SetColorInfo(
+          0, {.format = Prospero::ChannelLayout::k8_8_8_8,
+              .channel_type = Prospero::ChannelType::kSrgb,
+              .channel_order = Prospero::ChannelOrder::kStandard});
+      registers.SetColorAttrib2(0, {.height = height - 1, .width = width - 1});
+      registers.SetColorAttrib3(0,
+                                {.tile_mode = Prospero::TileMode::kRenderTarget,
+                                 .dimension = 0,
+                                 .cmask_pipe_aligned = true,
+                                 .dcc_pipe_aligned = true});
+      registers.SetRenderTargetMask(0x0f);
+      scheduler.Begin(registers, user_config, shaders);
+
+      auto &resources = context.GetGpuResources();
+      auto &texture_cache = resources.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      resources.MapMemory(base, allocation_size);
+
+      RenderColorInfo color{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(
+          executor, 1, scheduler.Current(), color, 0);
+      const auto attachment =
+          texture_cache.FindRenderTarget(color.image_id, color.desc);
+      const auto &image = texture_cache.GetImage(color.image_id);
+      RenderDepthInfo no_depth{};
+      const auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+          executor, scheduler.Current(), &color, 1, no_depth);
+      scheduler.Current().BeginRendering(rendering);
+      scheduler.Current().EndRendering();
+      Require(name, "captured 1D target",
+              color.image_id && attachment != nullptr &&
+                  color.image_view != nullptr &&
+                  color.desc.info.type == Prospero::ImageType::kColor1D &&
+                  color.desc.info.extent == vk::Extent3D{width, height, 1} &&
+                  color.desc.info.resources == ImageSubresources{1, 1} &&
+                  color.desc.info.pitch == pitch &&
+                  color.desc.info.data.size == layout.size &&
+                  color.desc.view_info.type == vk::ImageViewType::e1D &&
+                  image.backing.image_type == vk::ImageType::e1D &&
+                  rendering.width == width && rendering.height == height &&
+                  rendering.num_layers == 1 &&
+                  rendering.num_color_attachments == 1,
+              "SDK dimension=0 did not create a 512x1 Vulkan attachment");
+
+      RenderExecutorTestAccess::ResetBindings(executor);
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "1D color direct mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "1D color direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckRenderExecutorColorVolumeDiscovery() {
     constexpr const char *name = "RenderExecutorColorVolumeDiscovery";
     constexpr uintptr_t base = 0x0000000203e00000ull;
@@ -8946,7 +9049,7 @@ public:
 
   Buffer CreateStorageBuffer(const char *shader_name,
                              const std::vector<u32> &initial,
-                             size_t dword_count) {
+                             size_t dword_count, bool device_address = false) {
     Buffer ret;
     ret.size = static_cast<vk::DeviceSize>(std::max<size_t>(dword_count, 1u) *
                                            sizeof(u32));
@@ -8955,6 +9058,9 @@ public:
     buffer_info.sType = vk::StructureType::eBufferCreateInfo;
     buffer_info.size = ret.size;
     buffer_info.usage = vk::BufferUsageFlagBits::eStorageBuffer;
+    if (device_address) {
+      buffer_info.usage |= vk::BufferUsageFlagBits::eShaderDeviceAddress;
+    }
     buffer_info.sharingMode = vk::SharingMode::eExclusive;
     RequireVk(shader_name, "dispatch",
               m_device.createBuffer(&buffer_info, nullptr, &ret.buffer),
@@ -8979,12 +9085,26 @@ public:
     alloc.sType = vk::StructureType::eMemoryAllocateInfo;
     alloc.allocationSize = req.size;
     alloc.memoryTypeIndex = memory_type;
+    vk::MemoryAllocateFlagsInfo flags{};
+    if (device_address) {
+      flags.sType = vk::StructureType::eMemoryAllocateFlagsInfo;
+      flags.flags = vk::MemoryAllocateFlagBits::eDeviceAddress;
+      alloc.pNext = &flags;
+    }
     RequireVk(shader_name, "dispatch",
               m_device.allocateMemory(&alloc, nullptr, &ret.memory),
               "vkAllocateMemory");
     RequireVk(shader_name, "dispatch",
               m_device.bindBufferMemory(ret.buffer, ret.memory, 0),
               "vkBindBufferMemory");
+    if (device_address) {
+      vk::BufferDeviceAddressInfo address_info{};
+      address_info.sType = vk::StructureType::eBufferDeviceAddressInfo;
+      address_info.buffer = ret.buffer;
+      ret.device_address = m_device.getBufferAddress(address_info);
+      Require(shader_name, "dispatch", ret.device_address != 0,
+              "storage buffer has no device address");
+    }
 
     std::vector<u32> contents(dword_count, 0);
     for (size_t i = 0; i < initial.size() && i < contents.size(); i++) {
@@ -9366,7 +9486,9 @@ public:
       pool_sizes.push_back({type, count});
     };
     add_pool_size(vk::DescriptorType::eStorageBuffer,
-                  Count(Kind::Buffers) + Count(Kind::AddressMemory) +
+                  Count(Kind::Buffers) +
+                      (Binding(Kind::BdaPagetable) != nullptr ? 1u : 0u) +
+                      (Binding(Kind::FaultBuffer) != nullptr ? 1u : 0u) +
                       Count(Kind::Gds) +
                       (Binding(Kind::FlattenedSrt) != nullptr ? 1u : 0u) +
                       (Binding(Kind::UserData) != nullptr ? 1u : 0u));
@@ -9411,7 +9533,6 @@ public:
 
     std::vector<vk::WriteDescriptorSet> writes;
     std::vector<vk::DescriptorBufferInfo> buffer_infos;
-    std::vector<vk::DescriptorBufferInfo> address_memory_infos;
     std::vector<vk::DescriptorImageInfo> sampled_infos;
     std::vector<vk::DescriptorImageInfo> storage_infos;
     std::vector<vk::DescriptorImageInfo> storage_uint_infos;
@@ -9422,6 +9543,33 @@ public:
     vk::DescriptorBufferInfo flattened_info{};
     vk::DescriptorBufferInfo user_data_info{};
     vk::DescriptorBufferInfo gds_info{};
+    vk::DescriptorBufferInfo bda_pagetable_info{};
+    vk::DescriptorBufferInfo fault_buffer_info{};
+
+    const bool uses_bda = Binding(Kind::BdaPagetable) != nullptr;
+    Require(test.name, "dispatch",
+            uses_bda == (Binding(Kind::FaultBuffer) != nullptr),
+            "BDA page table and fault buffer must be bound together");
+    if (uses_bda) {
+      EnsureBdaBuffers(test.name);
+      bda_pagetable_info = {m_bda_pagetable_buffer.buffer, 0,
+                            m_bda_pagetable_buffer.size};
+      fault_buffer_info = {m_fault_buffer.buffer, 0, m_fault_buffer.size};
+      const std::array special_buffers{
+          std::pair{Kind::BdaPagetable, &bda_pagetable_info},
+          std::pair{Kind::FaultBuffer, &fault_buffer_info},
+      };
+      for (const auto &[kind, info] : special_buffers) {
+        vk::WriteDescriptorSet write{};
+        write.sType = vk::StructureType::eWriteDescriptorSet;
+        write.dstSet = descriptor_set;
+        write.dstBinding = Native(kind);
+        write.descriptorCount = 1;
+        write.descriptorType = vk::DescriptorType::eStorageBuffer;
+        write.pBufferInfo = info;
+        writes.push_back(write);
+      }
+    }
 
     const auto *buffers = Binding(Kind::Buffers);
     if (buffers != nullptr) {
@@ -9448,21 +9596,6 @@ public:
       write.descriptorCount = static_cast<u32>(buffer_infos.size());
       write.descriptorType = vk::DescriptorType::eStorageBuffer;
       write.pBufferInfo = buffer_infos.data();
-      writes.push_back(write);
-    }
-    if (const auto *address = Binding(Kind::AddressMemory);
-        address != nullptr) {
-      address_memory_infos.resize(address->resources.size());
-      for (auto &info : address_memory_infos) {
-        info = {buffer.buffer, 0, buffer.size};
-      }
-      vk::WriteDescriptorSet write{};
-      write.sType = vk::StructureType::eWriteDescriptorSet;
-      write.dstSet = descriptor_set;
-      write.dstBinding = Native(Kind::AddressMemory);
-      write.descriptorCount = static_cast<u32>(address_memory_infos.size());
-      write.descriptorType = vk::DescriptorType::eStorageBuffer;
-      write.pBufferInfo = address_memory_infos.data();
       writes.push_back(write);
     }
     if (const auto *flattened = Binding(Kind::FlattenedSrt);
@@ -9590,6 +9723,52 @@ public:
     }
 
     vk::CommandBuffer cmd = BeginCommands(test.name, "dispatch");
+    if (uses_bda) {
+      Require(test.name, "dispatch", buffer.device_address != 0,
+              "BDA test backing has no device address");
+      Require(test.name, "dispatch", !test.bda_mappings.empty(),
+              "BDA test has no explicit guest mapping");
+      cmd.fillBuffer(m_bda_pagetable_buffer.buffer, 0,
+                     m_bda_pagetable_buffer.size, 0);
+      cmd.fillBuffer(m_fault_buffer.buffer, 0, m_fault_buffer.size, 0);
+      for (const auto &[guest_base, backing] : test.bda_mappings) {
+        const auto page_offset = guest_base &
+                                 (BufferCache::CACHING_PAGESIZE - 1);
+        Require(test.name, "dispatch",
+                backing >= page_offset && backing < buffer.size,
+                "BDA test mapping begins outside its backing buffer");
+        const auto bytes = page_offset + buffer.size - backing;
+        const auto pages =
+            (bytes + BufferCache::CACHING_PAGESIZE - 1) /
+            BufferCache::CACHING_PAGESIZE;
+        auto address = buffer.device_address + backing - page_offset;
+        auto page = guest_base >> BufferCache::CACHING_PAGEBITS;
+        for (uint64_t mapped = 0; mapped < pages; mapped++) {
+          cmd.updateBuffer(m_bda_pagetable_buffer.buffer,
+                           (page + mapped) * sizeof(vk::DeviceAddress),
+                           sizeof(address), &address);
+          address += BufferCache::CACHING_PAGESIZE;
+        }
+      }
+      std::array<vk::BufferMemoryBarrier, 2> barriers{};
+      barriers[0].sType = vk::StructureType::eBufferMemoryBarrier;
+      barriers[0].srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      barriers[0].dstAccessMask = vk::AccessFlagBits::eShaderRead;
+      barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barriers[0].buffer = m_bda_pagetable_buffer.buffer;
+      barriers[0].offset = 0;
+      barriers[0].size = m_bda_pagetable_buffer.size;
+      barriers[1] = barriers[0];
+      barriers[1].dstAccessMask = vk::AccessFlagBits::eShaderRead |
+                                  vk::AccessFlagBits::eShaderWrite;
+      barriers[1].buffer = m_fault_buffer.buffer;
+      barriers[1].size = m_fault_buffer.size;
+      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                          vk::PipelineStageFlagBits::eComputeShader, {}, 0,
+                          nullptr, static_cast<u32>(barriers.size()),
+                          barriers.data(), 0, nullptr);
+    }
     cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
     cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layout, 0,
                            1, &descriptor_set, 0, nullptr);
@@ -10951,6 +11130,7 @@ private:
     allocator_info.device = m_device;
     allocator_info.pVulkanFunctions = &functions;
     allocator_info.vulkanApiVersion = VK_API_VERSION_1_3;
+    allocator_info.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
     RequireVk("VulkanHarness", "runtime context",
               static_cast<vk::Result>(vmaCreateAllocator(
                   &allocator_info, &m_runtime_context.allocator)),
@@ -11001,13 +11181,18 @@ private:
         if ((queues[i].queueFlags &
              (vk::QueueFlagBits::eCompute | vk::QueueFlagBits::eGraphics)) ==
             (vk::QueueFlagBits::eCompute | vk::QueueFlagBits::eGraphics)) {
+          vk::PhysicalDeviceVulkan12Features features12{};
+          features12.sType = vk::StructureType::ePhysicalDeviceVulkan12Features;
           vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{};
           barycentric.sType = vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
+          barycentric.pNext = &features12;
           vk::PhysicalDeviceFeatures2 features{};
           features.sType = vk::StructureType::ePhysicalDeviceFeatures2;
           features.pNext = &barycentric;
           physical.getFeatures2(&features);
-          if (barycentric.fragmentShaderBarycentric != true) {
+          if (barycentric.fragmentShaderBarycentric != true ||
+              features.features.shaderInt64 != true ||
+              features12.bufferDeviceAddress != true) {
             continue;
           }
           m_physical_device = physical;
@@ -11051,6 +11236,11 @@ private:
     Require("VulkanHarness", "dispatch",
             available_features.sampleRateShading == true,
             "sample-rate shading is not supported");
+    Require("VulkanHarness", "dispatch", available_features.shaderInt64 == true,
+            "shaderInt64 is not supported");
+    Require("VulkanHarness", "dispatch",
+            available_features12.bufferDeviceAddress == true,
+            "bufferDeviceAddress is not supported");
 
     float priority = 1.0f;
     vk::DeviceQueueCreateInfo queue_info{};
@@ -11067,6 +11257,7 @@ private:
     device_features12.sType =
         vk::StructureType::ePhysicalDeviceVulkan12Features;
     device_features12.timelineSemaphore = true;
+    device_features12.bufferDeviceAddress = true;
     vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{};
     barycentric.sType = vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
     barycentric.pNext = &device_features12;
@@ -11081,6 +11272,7 @@ private:
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = true;
     device_features.sampleRateShading = true;
+    device_features.shaderInt64 = true;
     device_info.pEnabledFeatures = &device_features;
     constexpr const char *device_extensions[] = {
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
@@ -11105,6 +11297,8 @@ private:
   void Destroy() {
     if (m_device != nullptr) {
       RequireVulkanSuccess(m_device.waitIdle(), "vkDeviceWaitIdle");
+      DestroyBuffer(&m_fault_buffer);
+      DestroyBuffer(&m_bda_pagetable_buffer);
       if (m_runtime_context.allocator != nullptr) {
         m_renderer.reset();
         vmaDestroyAllocator(m_runtime_context.allocator);
@@ -11276,6 +11470,53 @@ private:
     image->layout = final_layout;
   }
 
+  Buffer CreateDeviceBuffer(const char *shader_name, vk::DeviceSize size,
+                            vk::BufferUsageFlags usage) {
+    Buffer ret;
+    ret.size = size;
+    vk::BufferCreateInfo buffer_info{};
+    buffer_info.sType = vk::StructureType::eBufferCreateInfo;
+    buffer_info.size = size;
+    buffer_info.usage = usage;
+    buffer_info.sharingMode = vk::SharingMode::eExclusive;
+    RequireVk(shader_name, "dispatch",
+              m_device.createBuffer(&buffer_info, nullptr, &ret.buffer),
+              "vkCreateBuffer");
+
+    vk::MemoryRequirements requirements{};
+    m_device.getBufferMemoryRequirements(ret.buffer, &requirements);
+    u32 memory_type = 0;
+    Require(shader_name, "dispatch",
+            FindMemoryType(requirements.memoryTypeBits,
+                           vk::MemoryPropertyFlagBits::eDeviceLocal,
+                           &memory_type) ||
+                FindMemoryType(requirements.memoryTypeBits, {}, &memory_type),
+            "no memory type for BDA support buffer");
+    vk::MemoryAllocateInfo allocation{};
+    allocation.sType = vk::StructureType::eMemoryAllocateInfo;
+    allocation.allocationSize = requirements.size;
+    allocation.memoryTypeIndex = memory_type;
+    RequireVk(shader_name, "dispatch",
+              m_device.allocateMemory(&allocation, nullptr, &ret.memory),
+              "vkAllocateMemory");
+    RequireVk(shader_name, "dispatch",
+              m_device.bindBufferMemory(ret.buffer, ret.memory, 0),
+              "vkBindBufferMemory");
+    return ret;
+  }
+
+  void EnsureBdaBuffers(const char *shader_name) {
+    if (m_bda_pagetable_buffer.buffer != nullptr) {
+      return;
+    }
+    const auto usage = vk::BufferUsageFlagBits::eStorageBuffer |
+                       vk::BufferUsageFlagBits::eTransferDst;
+    m_bda_pagetable_buffer =
+        CreateDeviceBuffer(shader_name, BufferCache::BDA_PAGETABLE_SIZE, usage);
+    m_fault_buffer = CreateDeviceBuffer(
+        shader_name, BufferCache::CACHING_NUMPAGES / 8, usage);
+  }
+
   Buffer CreateHostBuffer(const char *shader_name, vk::DeviceSize size,
                           vk::BufferUsageFlags usage,
                           const std::vector<u32> &contents) {
@@ -11349,6 +11590,8 @@ private:
   vk::CommandPool m_command_pool = nullptr;
   u32 m_queue_family = 0;
   vk::PhysicalDeviceMemoryProperties m_memory_properties{};
+  Buffer m_bda_pagetable_buffer;
+  Buffer m_fault_buffer;
   GraphicContext m_runtime_context{};
   std::unique_ptr<RenderContext> m_renderer;
 };
@@ -11392,6 +11635,10 @@ void CompareGraphicsWords(const GraphicsCase &test,
 
 void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   auto compiled = CompileCase(test);
+  if (!test.expected_compile_error.empty()) {
+    std::printf("[compute] %-32s ok\n", test.name);
+    return;
+  }
   if (test.image_descriptor_swizzle != DstSel(4, 5, 6, 7)) {
     Require(test.name, "resource specialization",
             !compiled.program.info.images.empty() &&
@@ -11410,15 +11657,15 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
     std::printf("[compute] %-32s ok\n", test.name);
     return;
   }
-  const auto dwords = std::max<size_t>(
-      {test.initial.size(), test.expected.size(), static_cast<size_t>(1)});
-  auto buffer = vulkan->CreateStorageBuffer(test.name, test.initial, dwords);
-
   using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
   auto Has = [&](Kind kind) {
     return ShaderRecompiler::IR::FindBinding(compiled.program.bindings, kind) !=
            nullptr;
   };
+  const auto dwords = std::max<size_t>(
+      {test.initial.size(), test.expected.size(), static_cast<size_t>(1)});
+  auto buffer = vulkan->CreateStorageBuffer(
+      test.name, test.initial, dwords, Has(Kind::BdaPagetable));
   VulkanHarness::Image sampled_image;
   VulkanHarness::Image storage_image;
   VulkanHarness::Image storage_image_uint;
@@ -15602,6 +15849,58 @@ TestCase VectorVopcSdwaCmpxWritesExecMask() {
           {O::V_MOV_B32, O::V_CMPX_LT_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase VectorVopcCmpxGtU16CapturedSdwaExecMask() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 2, 0x00008000u);
+  AppendVMovU32(&code, 3, 7);
+  AppendVMovU32(&code, 31, 0);
+  code.insert(code.end(), {0x7d7900f9u, 0x86060002u});
+  AppendBufferStoreDword(&code, 3, 31);
+  AppendVMovU32(&code, 2, 0x00010000u);
+  AppendVMovU32(&code, 3, 9);
+  AppendVMovU32(&code, 31, 4);
+  code.insert(code.end(), {0x7d7900f9u, 0x86060002u});
+  AppendBufferStoreDword(&code, 3, 31);
+  AppendEnd(&code);
+
+  TestCase test{"VectorVopcCmpxGtU16CapturedSdwaExecMask",
+                code,
+                {0x11111111u, 0x22222222u},
+                {7, 0x22222222u},
+                {O::V_MOV_B32, O::V_CMPX_GT_U16, O::BUFFER_STORE_DWORD,
+                 O::S_ENDPGM}};
+  test.decoded_counts = {{"V_CMPX_GT_U16", 2}};
+  return test;
+}
+
+TestCase VectorVopcCmpxNgtF16CapturedSdwaExecMask() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 31, 0x7e003c00u);
+  AppendVMovU32(&code, 3, 7);
+  AppendVMovU32(&code, 30, 0);
+  code.insert(code.end(), {0x7df700f9u, 0x8605001fu});
+  AppendBufferStoreDword(&code, 3, 30);
+  AppendVMovLiteral(&code, 31, 0x3c007e00u);
+  AppendVMovU32(&code, 3, 9);
+  AppendVMovU32(&code, 30, 4);
+  code.insert(code.end(), {0x7df700f9u, 0x8605001fu});
+  AppendBufferStoreDword(&code, 3, 30);
+  AppendEnd(&code);
+
+  TestCase test{"VectorVopcCmpxNgtF16CapturedSdwaExecMask",
+                code,
+                {0x11111111u, 0x22222222u},
+                {7, 0x22222222u},
+                {O::V_MOV_B32, O::V_CMPX_NGT_F16, O::BUFFER_STORE_DWORD,
+                 O::S_ENDPGM}};
+  test.decoded_counts = {{"V_CMPX_NGT_F16", 2}};
+  return test;
+}
+
 TestCase VectorCompareInvertedMaskSelect() {
   using O = ShaderOpcode;
 
@@ -17341,16 +17640,16 @@ TestCase FlatLoadVariants() {
                  O::FLAT_LOAD_USHORT, O::FLAT_LOAD_SSHORT, O::FLAT_LOAD_DWORD,
                  O::FLAT_LOAD_DWORDX2, O::FLAT_LOAD_DWORDX3,
                  O::FLAT_LOAD_DWORDX4, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
-  test.flat_memory_base = 0;
-  test.address_memory_offsets = {static_cast<u32>(byte_offset)};
+  test.bda_mappings = {{0, static_cast<u32>(byte_offset)}};
   return test;
 }
 
 TestCase FlatSubdwordLoadsApplyByteOffset() {
   using O = ShaderOpcode;
 
+  constexpr size_t byte_offset = 3;
   std::vector<u32> code;
-  AppendVMovU32(&code, 20, 0);
+  AppendVMovU32(&code, 20, static_cast<u32>(byte_offset));
   AppendVMovU32(&code, 21, 0);
   code.push_back(EncodeFlat0(0x08, 0, 0));
   code.push_back(EncodeFlat1(0, 0x7d, 0, 20));
@@ -17360,7 +17659,6 @@ TestCase FlatSubdwordLoadsApplyByteOffset() {
   AppendStoreVgpr(&code, 1, 1);
   AppendEnd(&code);
 
-  constexpr size_t byte_offset = 3;
   constexpr u32 guest_word = 0x80ff7f01u;
   std::vector<u32> host_memory(
       (byte_offset + sizeof(guest_word) + sizeof(u32) - 1u) / sizeof(u32));
@@ -17372,8 +17670,7 @@ TestCase FlatSubdwordLoadsApplyByteOffset() {
   test.code = std::move(code);
   test.initial = std::move(host_memory);
   test.expected = {0x01u, 0x0000ff7fu};
-  test.flat_memory_base = 0;
-  test.address_memory_offsets = {static_cast<u32>(byte_offset)};
+  test.bda_mappings = {{0, 0}};
   test.opcodes = {O::V_MOV_B32, O::FLAT_LOAD_UBYTE, O::FLAT_LOAD_USHORT,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   return test;
@@ -17457,8 +17754,7 @@ TestCase FlatVirtualAddressRebasesGuestAllocation() {
   test.code = std::move(code);
   test.initial = {0xfeedfaceu, 0xcafebabeu, 0, 0x12345678u};
   test.expected = {0x12345678u, 0x12345678u, 0};
-  test.flat_memory_base = GuestBase;
-  test.address_memory_offsets = {8, 8, 8};
+  test.bda_mappings = {{GuestBase, 8}};
   test.opcodes = {O::V_MOV_B32, O::FLAT_LOAD_DWORD, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   return test;
@@ -17480,10 +17776,9 @@ TestCase GlobalSignedImmediateRebasesBeforeSaddr() {
   TestCase test;
   test.name = "GlobalSignedImmediateRebasesBeforeSaddr";
   test.code = std::move(code);
-  test.initial = {0xfeedfaceu, 0xcafebabeu, 0x11111111u, 0x22222222u,
-                  0x12345678u};
+  test.initial = {0xfeedfaceu, 0xcafebabeu, 0x11111111u, 0x12345678u};
   test.expected = {0x12345678u};
-  test.address_memory_offsets = {8};
+  test.bda_mappings = {{GuestBase, 8}};
   test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::FLAT_LOAD_DWORD,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   return test;
@@ -17517,7 +17812,7 @@ TestCase FlatSegmentIgnoresSaddrAndMasksOffsetMsb() {
   test.expected = {0x11111111u, 0x11111111u};
   test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::FLAT_LOAD_DWORD,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.flat_memory_base = 0;
+  test.bda_mappings = {{0, 0}};
   return test;
 }
 
@@ -17596,7 +17891,8 @@ TestCase FlatStoreVariants() {
                 {O::V_MOV_B32, O::FLAT_STORE_BYTE, O::FLAT_STORE_SHORT,
                  O::FLAT_STORE_DWORD, O::FLAT_STORE_DWORDX2,
                  O::FLAT_STORE_DWORDX3, O::FLAT_STORE_DWORDX4, O::S_ENDPGM}};
-  test.flat_memory_base = 0;
+  test.expected_compile_error =
+      "writable FLAT/GLOBAL addresses require GPU ownership tracking";
   return test;
 }
 
@@ -20129,6 +20425,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVop3FloatCompareNegSourceModifier);
   AddCase(VectorVop3CmpxWritesExecMask);
   AddCase(VectorVopcSdwaCmpxWritesExecMask);
+  AddCase(VectorVopcCmpxGtU16CapturedSdwaExecMask);
+  AddCase(VectorVopcCmpxNgtF16CapturedSdwaExecMask);
   AddCase(VectorCompareInvertedMaskSelect);
   AddCase(BranchSelect);
   AddCase(SimpleLoop);
@@ -22313,83 +22611,12 @@ void CheckStorageTextureDepthTileUploadLayout() {
           "1x1 R8_UINT depth tile lost its 64 KiB source footprint");
   std::printf("[host]    %-32s ok\n", "StorageTextureDepthTileUpload");
 }
-void CheckImageSpecializationId() {
-  std::array<u32, 1> code{};
-  HW::ComputeShaderInfo regs{};
-  regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(code.data());
-
-  ShaderRecompiler::IR::ImageResource image;
-  image.kind = ShaderRecompiler::IR::ResourceKind::StorageImage;
-  image.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
-  const auto make_program = [](ShaderRecompiler::IR::ImageResource resource) {
-    ShaderRecompiler::IR::Program program;
-    program.binding_layout_complete = true;
-    program.info.images.push_back(std::move(resource));
-    return program;
-  };
-  auto rgb1_image = image;
-  rgb1_image.shader_swizzle = DstSel(4, 5, 6, 1);
-  auto converted_image = image;
-  converted_image.conversion_format =
-      Prospero::BufferFormat::k11_11_10UInt;
-  auto mip1_image = image;
-  mip1_image.mip_mode = ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
-  auto mip3_image = mip1_image;
-  mip3_image.mip_count = 3;
-  auto array_image = image;
-  array_image.dimension =
-      ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
-  auto cube_image = array_image;
-  cube_image.cube = true;
-
-  const auto resources =
-      std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>();
-  ShaderComputeInputInfo identity_info;
-  identity_info.stage.program = std::make_shared<const ShaderRecompiler::IR::Program>(
-      make_program(image));
-  identity_info.stage.resources = resources;
-  auto rgb1_info = identity_info;
-  rgb1_info.stage.program = std::make_shared<const ShaderRecompiler::IR::Program>(
-      make_program(rgb1_image));
-  auto converted_info = identity_info;
-  converted_info.stage.program =
-      std::make_shared<const ShaderRecompiler::IR::Program>(
-          make_program(converted_image));
-  auto mip1_info = identity_info;
-  mip1_info.stage.program = std::make_shared<const ShaderRecompiler::IR::Program>(
-      make_program(mip1_image));
-  auto mip3_info = identity_info;
-  mip3_info.stage.program = std::make_shared<const ShaderRecompiler::IR::Program>(
-      make_program(mip3_image));
-  auto array_info = identity_info;
-  array_info.stage.program = std::make_shared<const ShaderRecompiler::IR::Program>(
-      make_program(array_image));
-  auto cube_info = identity_info;
-  cube_info.stage.program = std::make_shared<const ShaderRecompiler::IR::Program>(
-      make_program(cube_image));
-
-  const auto identity_id = ShaderGetIdCS(regs, identity_info, true);
-  const auto rgb1_id = ShaderGetIdCS(regs, rgb1_info, true);
-  const auto converted_id = ShaderGetIdCS(regs, converted_info, true);
-  const auto mip1_id = ShaderGetIdCS(regs, mip1_info, true);
-  const auto mip3_id = ShaderGetIdCS(regs, mip3_info, true);
-  const auto array_id = ShaderGetIdCS(regs, array_info, true);
-  const auto cube_id = ShaderGetIdCS(regs, cube_info, true);
-  Require("ImageSpecializationId", "pipeline cache key",
-          identity_id != rgb1_id &&
-              identity_id.ids.size() == rgb1_id.ids.size() &&
-              identity_id != converted_id &&
-              identity_id.ids.size() == converted_id.ids.size() &&
-              mip1_id != mip3_id && mip1_id.ids.size() == mip3_id.ids.size() &&
-              array_id != cube_id && array_id.ids.size() == cube_id.ids.size(),
-          "image conversion, swizzle, mip-count, or cube variants share a "
-          "pipeline ID");
-
+void CheckImageSamplerSpecialization() {
   ShaderSamplerResource filtered_sampler{};
   filtered_sampler.fields[2] =
       (1u << 20u) | (3u << 22u) | (2u << 24u) | (2u << 26u);
   filtered_sampler.SetPointFiltering();
-  Require("ImageSpecializationId", "forced point sampler",
+  Require("ImageSamplerSpecialization", "forced point sampler",
           filtered_sampler.XyMagFilter() == 0u &&
               filtered_sampler.XyMinFilter() == 0u &&
               filtered_sampler.ZFilter() == 1u &&
@@ -22399,7 +22626,7 @@ void CheckImageSpecializationId() {
   ShaderSamplerResource base_mip_sampler{};
   base_mip_sampler.fields[2] = (3u << 20u) | (1u << 22u) | (2u << 24u);
   base_mip_sampler.SetPointFiltering();
-  Require("ImageSpecializationId", "base-mip point sampler",
+  Require("ImageSamplerSpecialization", "base-mip point sampler",
           base_mip_sampler.XyMagFilter() == 0u &&
               base_mip_sampler.XyMinFilter() == 0u &&
               base_mip_sampler.ZFilter() == 1u &&
@@ -22437,12 +22664,12 @@ void CheckImageSpecializationId() {
   sampler_descriptor.dword_count = 4;
   mixed_sampler_snapshot.samplers.push_back(sampler_descriptor);
   std::string specialization_error;
-  Require("ImageSpecializationId", "mixed sampler specialization",
+  Require("ImageSamplerSpecialization", "mixed sampler specialization",
           ShaderRecompiler::IR::SpecializeResources(mixed_sampler_program,
                                                     mixed_sampler_snapshot,
                                                     &specialization_error),
           specialization_error);
-  Require("ImageSpecializationId", "mixed sampler variant",
+  Require("ImageSamplerSpecialization", "mixed sampler variant",
           mixed_sampler_program.info.samplers.size() == 2u &&
               !mixed_sampler_program.info.samplers[0].force_point_filtering &&
               mixed_sampler_program.info.samplers[1].force_point_filtering &&
@@ -22463,7 +22690,7 @@ void CheckImageSpecializationId() {
   ShaderRecompiler::IR::ResourceSnapshot packed_atomic_snapshot;
   packed_atomic_snapshot.images.push_back(packed_image_descriptor);
   std::string atomic_error;
-  Require("ImageSpecializationId", "packed atomic rejection",
+  Require("ImageSamplerSpecialization", "packed atomic rejection",
           !ShaderRecompiler::IR::SpecializeResources(
               packed_atomic_program, packed_atomic_snapshot, &atomic_error) &&
               atomic_error.find("unsupported format 34") != std::string::npos,
@@ -24110,6 +24337,7 @@ int main(int argc, char **argv) {
     CheckDepthAttachmentWrites();
     CheckDynamicRenderingState();
     VulkanHarness vulkan;
+    vulkan.CheckRenderExecutorColor1DDiscovery();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
@@ -24194,7 +24422,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--indirect-image-only") == 0) {
-    CheckImageSpecializationId();
+    CheckImageSamplerSpecialization();
     CheckIndirectImageKeySwitch();
     return 0;
   }
@@ -24236,7 +24464,7 @@ int main(int argc, char **argv) {
   CheckBasicStorageTextureDescriptor();
   CheckStorageTextureLinearUploadLayout();
   CheckStorageTextureDepthTileUploadLayout();
-  CheckImageSpecializationId();
+  CheckImageSamplerSpecialization();
   CheckStandard64RenderTargetTileRoundTrip();
   CheckStorageTextureVolumeUploadLayout();
   CheckStorageTextureVolumeMipRegions();
@@ -24284,6 +24512,7 @@ int main(int argc, char **argv) {
   vulkan.CheckStreamBufferRing();
   vulkan.CheckGpuTilerCpuParity();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  vulkan.CheckRenderExecutorColor1DDiscovery();
   vulkan.CheckRenderExecutorColorVolumeDiscovery();
   vulkan.CheckRenderExecutorColorStandard4TileDiscovery();
   vulkan.CheckRenderExecutorColorDepthTileDiscovery();
