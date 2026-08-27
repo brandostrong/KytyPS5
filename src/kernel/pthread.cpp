@@ -10,6 +10,7 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "kernel/memory.h"
+#include "kernel/freezeProbe.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/runtimeLinker.h"
@@ -3182,6 +3183,8 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	PRINT_NAME();
 
+	FreezeProbe::SetCallerPc();
+
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
 
 	cond = static_cast<PthreadCond*>(
@@ -3220,7 +3223,12 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 		return cond_value->sequence != sequence || thread->cond_sequence != thread_sequence;
 	};
 
+	bool probe_recorded = false;
 	while (!ready()) {
+		if (!probe_recorded) {
+			probe_recorded = FreezeProbe::RecordBlock('C', reinterpret_cast<uint64_t>(cond_value),
+			                                          0, true);
+		}
 		cond_value->cv.wait_for(cond_lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
 		if (!ready()) {
 			cond_lock.unlock();
@@ -3230,6 +3238,10 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 	}
 	CondRemoveWaiter(cond_value, thread);
 	cond_lock.unlock();
+
+	if (probe_recorded) {
+		FreezeProbe::RecordWake('C', reinterpret_cast<uint64_t>(cond_value), 0);
+	}
 
 	result = NativeMutexLockRecurse(mutex_value, recurse);
 

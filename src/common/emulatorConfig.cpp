@@ -77,6 +77,10 @@ bool GraphicsDebugDumpEnabled() {
 	return g_config->graphics_debug_dump_enabled;
 }
 
+bool GpuLogPassesEnabled() {
+	return g_config->gpu_log_passes_enabled;
+}
+
 OutputDirection GetPrintfDirection() {
 	return g_config->printf_direction;
 }

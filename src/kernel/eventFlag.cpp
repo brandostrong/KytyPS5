@@ -6,6 +6,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "kernel/freezeProbe.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -114,6 +115,8 @@ KernelEventFlagPrivate::Result KernelEventFlagPrivate::Wait(uint64_t bits, WaitM
 	Common::Timer t;
 	t.Start();
 
+	bool probe_recorded = false;
+
 	auto update_timeout = [&]() {
 		if (ptr_micros != nullptr) {
 			*ptr_micros = (elapsed >= micros ? 0 : micros - elapsed);
@@ -132,6 +135,11 @@ KernelEventFlagPrivate::Result KernelEventFlagPrivate::Wait(uint64_t bits, WaitM
 			}
 			update_timeout();
 			return Result::TimedOut;
+		}
+
+		if (infinitely && !probe_recorded) {
+			probe_recorded = FreezeProbe::RecordBlock('V', reinterpret_cast<uint64_t>(this), bits,
+			                                           true);
 		}
 
 		m_waiting_threads++;
@@ -161,6 +169,10 @@ KernelEventFlagPrivate::Result KernelEventFlagPrivate::Wait(uint64_t bits, WaitM
 				return Result::Deleted;
 			case Status::Set: break;
 		}
+	}
+
+	if (probe_recorded) {
+		FreezeProbe::RecordWake('V', reinterpret_cast<uint64_t>(this), bits);
 	}
 
 	if (result != nullptr) {
@@ -291,6 +303,8 @@ int KYTY_SYSV_ABI KernelWaitEventFlag(KernelEventFlag ef, uint64_t bit_pattern, 
 	if (ef == nullptr) {
 		return KERNEL_ERROR_ESRCH;
 	}
+
+	FreezeProbe::SetCallerPc();
 
 	if (bit_pattern == 0) {
 		return KERNEL_ERROR_EINVAL;

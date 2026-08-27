@@ -62,6 +62,20 @@ bool graphics_debug_dump_enabled() {
 	       Config::GetPrintfDirection() != Config::OutputDirection::Silent;
 }
 
+// Process-global, monotonically increasing ID assigned to every emitted Vulkan draw/dispatch.
+// The ID is allocated even when logging is disabled so that later consumers (debug labels,
+// skip filters) can rely on the same numbering.
+static std::atomic<uint64_t> g_gpu_pass_id {1};
+
+uint64_t NextGpuPassId() {
+	return g_gpu_pass_id.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool GpuPassLogEnabled() {
+	return Config::GpuLogPassesEnabled() &&
+	       Config::GetPrintfDirection() != Config::OutputDirection::Silent;
+}
+
 void uc_print(const char* func, const HW::UserConfig& uc) {
 	LOGF("%s\n", func);
 

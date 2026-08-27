@@ -30,6 +30,8 @@ struct ScissorRect {
 uint32_t                 render_target_mask_slot(uint32_t mask, uint32_t slot);
 uint32_t                 render_target_first_bound_slot(const RenderCommandBuffer& buffer);
 bool                     graphics_debug_dump_enabled();
+uint64_t                 NextGpuPassId();
+bool                     GpuPassLogEnabled();
 void                     uc_print(const char* func, const HW::UserConfig& uc);
 void                     uc_check(const HW::UserConfig& uc);
 void                     sh_print(const char* func, const HW::Shader& uc);

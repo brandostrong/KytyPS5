@@ -5,6 +5,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "kernel/freezeProbe.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -222,6 +223,10 @@ KernelSemaPrivate::Result KernelSemaPrivate::Wait(int need_count, uint32_t* ptr_
 	waiter.need_count = need_count;
 	AddWaiter(&waiter);
 
+	if (infinitely) {
+		FreezeProbe::RecordBlock('S', reinterpret_cast<uint64_t>(this), need_count, true);
+	}
+
 	while (!waiter.ready) {
 		if ((elapsed >= micros && !infinitely)) {
 			RemoveWaiter(&waiter);
@@ -246,6 +251,10 @@ KernelSemaPrivate::Result KernelSemaPrivate::Wait(int need_count, uint32_t* ptr_
 
 	if (ptr_micros != nullptr) {
 		*ptr_micros = (elapsed >= micros ? 0 : micros - elapsed);
+	}
+
+	if (infinitely) {
+		FreezeProbe::RecordWake('S', reinterpret_cast<uint64_t>(this), need_count);
 	}
 
 	return waiter.result;
@@ -290,6 +299,8 @@ int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time)
 	if (sem == nullptr) {
 		return KERNEL_ERROR_ESRCH;
 	}
+
+	FreezeProbe::SetCallerPc();
 
 	auto result = sem->Wait(need, time);
 
@@ -407,6 +418,7 @@ public:
 		Common::Timer timer;
 		timer.Start();
 
+		bool probe_recorded = false;
 		while (m_count <= 0) {
 			if (timed_wait && elapsed >= *micros) {
 				SyncGuest();
@@ -415,6 +427,12 @@ public:
 
 			m_waiters++;
 			SyncGuest();
+
+			if (!timed_wait && !probe_recorded) {
+				probe_recorded = LibKernel::FreezeProbe::RecordBlock('S',
+				                                                    reinterpret_cast<uint64_t>(this),
+				                                                    0, true);
+			}
 
 			if (timed_wait) {
 				m_cond_var.WaitFor(&m_mutex, *micros - elapsed);
@@ -432,6 +450,10 @@ public:
 
 		m_count--;
 		SyncGuest();
+
+		if (probe_recorded) {
+			LibKernel::FreezeProbe::RecordWake('S', reinterpret_cast<uint64_t>(this), 0);
+		}
 
 		return OK;
 	}
@@ -624,6 +646,7 @@ int KYTY_SYSV_ABI sem_destroy(void* sem) {
 }
 
 int KYTY_SYSV_ABI sem_wait(void* sem) {
+	LibKernel::FreezeProbe::SetCallerPc();
 	const int result = SemTimedwaitImpl(sem, nullptr);
 	return (result == OK ? 0 : SetErrnoReturn(result));
 }
@@ -697,6 +720,7 @@ int KYTY_SYSV_ABI PthreadSemDestroy(void* sem) {
 }
 
 int KYTY_SYSV_ABI PthreadSemWait(void* sem) {
+	FreezeProbe::SetCallerPc();
 	const int result = Posix::SemTimedwaitImpl(sem, nullptr);
 	return (result == OK ? OK : Posix::PosixToKernel(result));
 }

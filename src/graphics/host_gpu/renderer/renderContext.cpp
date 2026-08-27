@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
+#include "kernel/freezeProbe.h"
 #include "libs/errno.h"
 
 #include <algorithm>
@@ -66,6 +67,8 @@ void RenderContext::AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int e
 	}
 
 	m_interrupt_eqs.push_back({eq, event_id});
+
+	LibKernel::FreezeProbe::Note("eq-reg eq=0x%llx id=%d", static_cast<unsigned long long>(eq), event_id);
 }
 
 void RenderContext::DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id) {
@@ -79,18 +82,25 @@ void RenderContext::DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, in
 	}
 
 	m_interrupt_eqs.erase(it);
+
+	LibKernel::FreezeProbe::Note("eq-unreg eq=0x%llx id=%d", static_cast<unsigned long long>(eq), event_id);
 }
 
 void RenderContext::TriggerInterrupt(int event_id, uint32_t context_id) {
 	std::vector<InterruptEqRegistration> registrations;
+	size_t                               total = 0;
 	{
 		Common::LockGuard lock(m_interrupt_mutex);
+		total = m_interrupt_eqs.size();
 		for (const auto& registration: m_interrupt_eqs) {
 			if (registration.event_id == event_id) {
 				registrations.push_back(registration);
 			}
 		}
 	}
+
+	LibKernel::FreezeProbe::Note("eop-int event=%d ctx=0x%08x matched=%zu total=%zu", event_id, context_id,
+	                             registrations.size(), total);
 
 	for (const auto& registration: registrations) {
 		const auto result = LibKernel::EventQueue::KernelTriggerEvent(

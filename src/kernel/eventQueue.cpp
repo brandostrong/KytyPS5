@@ -6,6 +6,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "kernel/freezeProbe.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -175,11 +176,21 @@ int KernelEqueuePrivate::WaitForEvents(KernelEvent* ev, int num, uint32_t micros
 	Common::Timer t;
 	t.Start();
 
+	bool probe_recorded = false;
 	for (;;) {
 		int ret = GetTriggeredEvents(ev, num);
 
 		if (ret != 0 || (elapsed >= micros && micros != 0)) {
+			if (probe_recorded) {
+				FreezeProbe::RecordWake('E', reinterpret_cast<uint64_t>(this),
+				                        (ret != 0 ? ev[0].ident : 0));
+			}
 			return ret;
+		}
+
+		if (micros == 0 && !probe_recorded) {
+			probe_recorded = FreezeProbe::RecordBlock('E', reinterpret_cast<uint64_t>(this), 0,
+			                                           true);
 		}
 
 		uint32_t   timer_wait = 0;
@@ -386,6 +397,8 @@ int KYTY_SYSV_ABI KernelDeleteEqueue(KernelEqueue eq) {
 int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, int* out,
                                    const KernelUseconds* timo) {
 	PRINT_NAME();
+
+	FreezeProbe::SetCallerPc();
 
 	auto owner = KernelPinEqueue(eq);
 	if (!owner) {
