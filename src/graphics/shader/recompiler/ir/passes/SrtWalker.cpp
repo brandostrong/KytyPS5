@@ -536,6 +536,10 @@ private:
 		} else {
 			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 		}
+		if (m_runtime.read_log != nullptr) {
+			m_runtime.read_log->push_back(
+			    {m_runtime.read_memory, m_runtime.userdata, address, word});
+		}
 		result = word;
 		return true;
 	}

@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <span>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -11,12 +12,21 @@ class Value;
 
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, uint32_t* value);
 
+// One guest read performed while materializing, enough to replay and re-check it later.
+struct SrtMemoryRead {
+	SrtMemoryReader reader   = nullptr;
+	void*           userdata = nullptr;
+	uint64_t        address  = 0;
+	uint32_t        value    = 0;
+};
+
 struct SrtRuntime {
-	std::span<const uint32_t> user_data;
-	uint64_t                  shader_base                = 0;
-	SrtMemoryReader           read_memory                = nullptr;
-	void*                     userdata                   = nullptr;
-	SrtMemoryReader           read_specialization_memory = nullptr;
+	std::span<const uint32_t>   user_data;
+	uint64_t                    shader_base                = 0;
+	SrtMemoryReader             read_memory                = nullptr;
+	void*                       userdata                   = nullptr;
+	SrtMemoryReader             read_specialization_memory = nullptr;
+	std::vector<SrtMemoryRead>* read_log                   = nullptr;
 };
 
 struct DescriptorSourceRequest {
